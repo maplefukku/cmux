@@ -35,6 +35,7 @@ export const IROH_RETENTION_BATCH_SIZE = 500;
 export const IROH_RETENTION_MAX_ROWS = 10_000;
 export const IROH_RETENTION_MAX_DURATION_MS = 8_000;
 export const IROH_RELAY_RESERVATION_LEASE_MS = 60 * 1_000;
+export const IROH_REGISTRATION_CHALLENGE_MIN_SPACING_MS = 2_000;
 
 export type IrohRetentionCategory =
   | "revokedHints"
@@ -190,6 +191,29 @@ function makeLiveRepository(): IrohRepositoryShape {
       return await db.transaction(async (tx) => {
         await assertIrohUserMutationAllowed(tx, input.userId);
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`iroh:challenge:${input.userId}`}, 0))`);
+        const challengeFloorCutoff = new Date(
+          input.now.getTime() - IROH_REGISTRATION_CHALLENGE_MIN_SPACING_MS,
+        );
+        const [latestForSlot] = await tx
+          .select({ createdAt: irohRegistrationChallenges.createdAt })
+          .from(irohRegistrationChallenges)
+          .where(and(
+            eq(irohRegistrationChallenges.userId, input.userId),
+            eq(irohRegistrationChallenges.deviceUuid, input.deviceUuid),
+            eq(irohRegistrationChallenges.appInstanceId, input.appInstanceId),
+            eq(irohRegistrationChallenges.tag, input.tag),
+            gt(irohRegistrationChallenges.createdAt, challengeFloorCutoff),
+          ))
+          .orderBy(desc(irohRegistrationChallenges.createdAt))
+          .limit(1);
+        if (latestForSlot) {
+          throw quotaFromOldest(
+            "challenge_retry_after",
+            latestForSlot.createdAt,
+            Math.ceil(IROH_REGISTRATION_CHALLENGE_MIN_SPACING_MS / 1_000),
+            input.now,
+          );
+        }
         // The register gate rejects a challenge whose createdAt is strictly
         // below the slot's registeredAt high-water mark. Both are millisecond
         // wall clocks, so two serialized mints can carry EQUAL timestamps; a

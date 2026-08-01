@@ -16,6 +16,7 @@ import {
   IrohRepositoryLive,
   type IrohRepositoryShape,
 } from "../services/iroh/repository";
+import { IrohQuotaExceededError } from "../services/iroh/errors";
 import type { RelayCatalog } from "../services/relay/model";
 import {
   RelayRepository,
@@ -26,6 +27,7 @@ import {
 const runDbTests = process.env.CMUX_DB_TEST === "1";
 const dbTest = runDbTests ? test : test.skip;
 const NOW = new Date("2026-07-09T20:00:00.000Z");
+const REGISTRATION_CHALLENGE_FLOOR_MS = 2_000;
 
 let sql: Sql | null = null;
 let repository: IrohRepositoryShape | null = null;
@@ -362,6 +364,56 @@ describe("Iroh trust broker database behavior", () => {
       issuanceStatus: "pending",
       securityStates: "0",
     });
+  });
+
+  dbTest("paces repeated registration challenges for one device slot", async () => {
+    const repo = requiredRepository();
+    const userId = "user-registration-floor";
+    const deviceUuid = randomUUID();
+    const appInstanceId = randomUUID();
+    const input = {
+      userId,
+      deviceUuid,
+      appInstanceId,
+      tag: "stable",
+      endpointId: "11".repeat(32),
+      identityGeneration: 1,
+      payloadSha256: "12".repeat(32),
+      nonceHash: "13".repeat(32),
+      expiresAt: new Date(NOW.getTime() + 5 * 60 * 1_000),
+    };
+
+    await Effect.runPromise(repo.issueChallenge({ ...input, now: NOW }));
+    const tooSoon = await Effect.runPromiseExit(repo.issueChallenge({
+      ...input,
+      nonceHash: "14".repeat(32),
+      now: new Date(NOW.getTime() + 500),
+    }));
+
+    if (tooSoon._tag !== "Failure") {
+      throw new Error("expected repeated challenge to be paced");
+    }
+    const defect = Cause.failureOption(tooSoon.cause);
+    expect(Option.isSome(defect)).toBe(true);
+    if (Option.isSome(defect)) {
+      expect(defect.value).toBeInstanceOf(IrohQuotaExceededError);
+      expect(defect.value).toMatchObject({
+        code: "challenge_retry_after",
+        retryAfterSeconds: 2,
+      });
+    }
+
+    await Effect.runPromise(repo.issueChallenge({
+      ...input,
+      nonceHash: "15".repeat(32),
+      now: new Date(NOW.getTime() + REGISTRATION_CHALLENGE_FLOOR_MS),
+    }));
+    const [{ total }] = await requiredSql()<Array<{ total: string }>>`
+      select count(*)::text as total
+      from iroh_registration_challenges
+      where user_id = ${userId}
+    `;
+    expect(total).toBe("2");
   });
 
   dbTest("atomically consumes a challenge exactly once under concurrency", async () => {
